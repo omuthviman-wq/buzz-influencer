@@ -391,9 +391,11 @@ async function resolveModel() {
   return best;
 }
 
-async function gemini(system, prompt, schema, retried = false) {
-  if (!SET.apiKey) throw new Error("APIキーが設定されていません（自分タブ→設定）");
-  const model = !SET.model || SET.model === "auto" ? await resolveModel() : SET.model;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// モデルを替えればうまくいくかもしれないエラー（廃止・混雑・そのモデルの無料枠切れ）
+const SWITCHABLE = [404, 429, 500, 503];
+
+async function callModel(model, system, prompt, schema) {
   let res;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
@@ -411,21 +413,12 @@ async function gemini(system, prompt, schema, retried = false) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const msg = data.error?.message ?? "";
-    if (res.status === 429) throw new Error("無料枠の回数制限です。1〜2分待ってもう一度（1日の上限なら明日）");
-    if (res.status === 400 && /API key/i.test(msg)) throw new Error("APIキーが正しくないみたい");
-    if (res.status === 404) {
-      // モデルが廃止・改名されていたら、使えるモデルに自動で切り替えてもう一度
-      if (!retried) {
-        const next = await resolveModel();
-        if (next !== model) {
-          toast(`モデルを ${next} に切り替えました`);
-          return gemini(system, prompt, schema, true);
-        }
-      }
-      throw new Error(`モデル「${model}」が見つかりません（設定で変更してね）`);
-    }
-    if (res.status === 503) throw new Error("Geminiが混み合っています。少し待ってもう一度");
-    throw new Error(`Geminiエラー ${res.status}: ${msg}`);
+    let text = `Geminiエラー ${res.status}: ${msg}`;
+    if (res.status === 429) text = "無料枠の回数制限です。1〜2分待ってもう一度（1日の上限なら明日）";
+    else if (res.status === 400 && /API key/i.test(msg)) text = "APIキーが正しくないみたい";
+    else if (res.status === 404) text = `モデル「${model}」が見つかりません（設定で変更してね）`;
+    else if (res.status === 503 || res.status === 500) text = "Geminiが混み合っています。少し待ってもう一度";
+    throw Object.assign(new Error(text), { status: res.status });
   }
   const cand = data.candidates?.[0];
   const text = (cand?.content?.parts ?? []).filter((p) => !p.thought && p.text).map((p) => p.text).join("");
@@ -435,6 +428,46 @@ async function gemini(system, prompt, schema, retried = false) {
   } catch {
     throw new Error("AIの返事を読み取れませんでした。もう一度試してね");
   }
+}
+
+async function gemini(system, prompt, schema) {
+  if (!SET.apiKey) throw new Error("APIキーが設定されていません（自分タブ→設定）");
+  const model = !SET.model || SET.model === "auto" ? await resolveModel() : SET.model;
+  let first;
+  try {
+    return await callModel(model, system, prompt, schema);
+  } catch (e) {
+    if (!SWITCHABLE.includes(e.status)) throw e;
+    first = e;
+  }
+  // 混雑ならちょっと待って同じモデルでもう1回
+  if (first.status === 503 || first.status === 500) {
+    await sleep(2000);
+    try {
+      return await callModel(model, system, prompt, schema);
+    } catch (e) {
+      if (!SWITCHABLE.includes(e.status)) throw e;
+    }
+  }
+  // ほかのモデルを順番に試す
+  let others = [];
+  try {
+    others = sortModels(await listModels()).filter((n) => n !== model).slice(0, 4);
+  } catch {
+    throw first;
+  }
+  for (const m of others) {
+    try {
+      const r = await callModel(m, system, prompt, schema);
+      SET.model = m;
+      saveSettings();
+      toast(`${model} がダメだったので ${m} に切り替えました`);
+      return r;
+    } catch (e) {
+      if (!SWITCHABLE.includes(e.status)) throw e;
+    }
+  }
+  throw first;
 }
 
 /* ================= 1日の投稿 ================= */
