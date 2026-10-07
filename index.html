@@ -179,8 +179,7 @@
       <input id="s-key" class="in" placeholder="AIza..." autocomplete="off">
       <label class="f">モデル</label>
       <select id="s-model" class="in">
-        <option value="gemini-2.5-flash">gemini-2.5-flash（おすすめ）</option>
-        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite（速い・無料の回数が多め）</option>
+        <option value="auto">自動で選ぶ（おすすめ）</option>
         <option value="custom">その他（自分で入力）</option>
       </select>
       <input id="s-model-custom" class="in hidden" style="margin-top:6px" placeholder="モデル名">
@@ -284,7 +283,7 @@ const SHOP = [
 
 /* ================= 状態 ================= */
 let S = null;          // ゲームのセーブデータ
-let SET = { apiKey: "", model: "gemini-2.5-flash" };
+let SET = { apiKey: "", model: "auto" };
 let busy = false;
 
 function loadAll() {
@@ -352,9 +351,49 @@ function toGeminiSchema(schema) {
   return out;
 }
 
-async function gemini(system, prompt, schema) {
+// このAPIキーで使えるモデルの一覧（文章を作れるGeminiだけ）
+async function listModels() {
+  let res;
+  try {
+    res = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { headers: { "x-goog-api-key": SET.apiKey } });
+  } catch {
+    throw new Error("通信できませんでした。電波を確認してね");
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 400 || res.status === 403) throw new Error("APIキーが正しくないみたい");
+    throw new Error(`モデル一覧を取得できませんでした（${res.status}）`);
+  }
+  return (data.models || [])
+    .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
+    .map((m) => String(m.name).replace(/^models\//, ""))
+    .filter((n) => /^gemini/.test(n) && !/image|tts|audio|live|embed|robotics|computer|native|learnlm/.test(n));
+}
+
+// 新しくて軽いFlash系を優先して1つ選ぶ
+function modelScore(n) {
+  const v = parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || "0");
+  let s = v * 10;
+  if (/flash/.test(n)) s += 100;
+  if (/lite/.test(n)) s -= 30;
+  if (/pro|ultra/.test(n)) s -= 60;
+  if (/preview|exp/.test(n)) s -= 15;
+  if (/latest/.test(n)) s += 35;
+  return s;
+}
+function sortModels(names) { return [...names].sort((a, b) => modelScore(b) - modelScore(a)); }
+
+async function resolveModel() {
+  const best = sortModels(await listModels())[0];
+  if (!best) throw new Error("このAPIキーで使えるGeminiのモデルが見つかりませんでした");
+  SET.model = best;
+  saveSettings();
+  return best;
+}
+
+async function gemini(system, prompt, schema, retried = false) {
   if (!SET.apiKey) throw new Error("APIキーが設定されていません（自分タブ→設定）");
-  const model = SET.model || "gemini-2.5-flash";
+  const model = !SET.model || SET.model === "auto" ? await resolveModel() : SET.model;
   let res;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
@@ -374,7 +413,17 @@ async function gemini(system, prompt, schema) {
     const msg = data.error?.message ?? "";
     if (res.status === 429) throw new Error("無料枠の回数制限です。1〜2分待ってもう一度（1日の上限なら明日）");
     if (res.status === 400 && /API key/i.test(msg)) throw new Error("APIキーが正しくないみたい");
-    if (res.status === 404) throw new Error(`モデル「${model}」が見つかりません（設定で変更してね）`);
+    if (res.status === 404) {
+      // モデルが廃止・改名されていたら、使えるモデルに自動で切り替えてもう一度
+      if (!retried) {
+        const next = await resolveModel();
+        if (next !== model) {
+          toast(`モデルを ${next} に切り替えました`);
+          return gemini(system, prompt, schema, true);
+        }
+      }
+      throw new Error(`モデル「${model}」が見つかりません（設定で変更してね）`);
+    }
     if (res.status === 503) throw new Error("Geminiが混み合っています。少し待ってもう一度");
     throw new Error(`Geminiエラー ${res.status}: ${msg}`);
   }
@@ -773,26 +822,43 @@ function buy(id) {
 
 /* ----- 設定 ----- */
 function openSettings() {
-  const known = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
-  const custom = !known.includes(SET.model);
   openSheet(`
     <h2>⚙️ 設定</h2>
     <label class="f">GeminiのAPIキー</label>
     <input id="st-key" class="in" value="${esc(SET.apiKey)}" placeholder="AIza..." autocomplete="off">
     <p class="hint"><a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> で無料で発行できます</p>
     <label class="f">モデル</label>
-    <input id="st-model" class="in" value="${esc(SET.model)}" list="model-list">
-    <datalist id="model-list">${known.map((m) => `<option value="${m}">`).join("")}</datalist>
-    <p class="hint">回数制限に引っかかりやすいときは gemini-2.5-flash-lite に${custom ? "" : "変えてみてね"}</p>
+    <input id="st-model" class="in" value="${esc(SET.model)}" placeholder="auto">
+    <p class="hint">「auto」にすると、使えるモデルから自動で選びます。回数制限に引っかかりやすいときは名前に「lite」がつくモデルにしてみてね</p>
+    <button class="btn block" id="st-list">🔍 使えるモデルを調べる</button>
+    <div class="chips" id="st-models" style="margin-top:8px"></div>
     <button class="btn main block" style="margin-top:12px" id="st-save">保存</button>
     <hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
     <button class="btn danger block" id="st-reset">データを消して最初から</button>`);
   $("st-save").onclick = () => {
     SET.apiKey = $("st-key").value.trim();
-    SET.model = $("st-model").value.trim() || "gemini-2.5-flash";
+    SET.model = $("st-model").value.trim() || "auto";
     saveSettings();
     closeSheet();
     toast("保存しました");
+  };
+  $("st-list").onclick = async () => {
+    const key = $("st-key").value.trim();
+    if (!key) return toast("先にAPIキーを入れてね");
+    SET.apiKey = key;
+    $("st-models").innerHTML = '<span class="hint">調べています…</span>';
+    try {
+      const names = sortModels(await listModels());
+      $("st-models").innerHTML = names.length
+        ? names.map((n) => `<button class="chip" data-m="${esc(n)}">${esc(n)}</button>`).join("")
+        : '<span class="hint">使えるモデルがありませんでした</span>';
+      $("st-models").querySelectorAll(".chip").forEach((b) => b.onclick = () => {
+        $("st-model").value = b.dataset.m;
+        $("st-models").querySelectorAll(".chip").forEach((x) => x.classList.toggle("on", x === b));
+      });
+    } catch (e) {
+      $("st-models").innerHTML = `<span class="hint">${esc(e.message)}</span>`;
+    }
   };
   $("st-reset").onclick = () => {
     if (!confirm("今のゲームを消して、キャラ作りからやり直しますか？")) return;
@@ -952,7 +1018,7 @@ function showSetup() {
     if (!name) return toast("名前を入れてね");
     if (!persona) return toast("性格・口調を入れてね");
     SET.apiKey = key;
-    SET.model = model || "gemini-2.5-flash";
+    SET.model = model || "auto";
     saveSettings();
     newGame({ name, handle, avatar, genre, persona });
     showGame();
